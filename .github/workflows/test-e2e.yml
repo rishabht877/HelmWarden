@@ -1,8 +1,11 @@
 name: E2E Tests
 
+# E2E spins up a kind cluster, builds + loads the manager image, and deploys the operator
+# in-cluster. It is run on demand (workflow_dispatch) until the in-cluster deploy path lands
+# in Phase 4 (writable HELM dirs on the distroless image + cluster-admin RBAC); it will be
+# re-enabled on push / pull_request then.
 on:
-  push:
-  pull_request:
+  workflow_dispatch:
 
 permissions: {}
 
