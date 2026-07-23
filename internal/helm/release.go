@@ -117,6 +117,29 @@ func (m *Manager) InstallOrUpgrade(ctx context.Context, spec ReleaseSpec) (*Rele
 	return toResult(raw)
 }
 
+// Uninstall removes the release if it exists. It is a no-op when the release is already gone,
+// so it is safe to call repeatedly from a finalizer.
+func (m *Manager) Uninstall(_ context.Context, releaseName, namespace string) error {
+	cfg, err := m.newActionConfig(namespace)
+	if err != nil {
+		return err
+	}
+	exists, err := releaseExists(cfg, releaseName)
+	if err != nil {
+		return err
+	}
+	if !exists {
+		return nil
+	}
+	un := action.NewUninstall(cfg)
+	un.WaitStrategy = waitStrategy
+	un.Timeout = defaultTimeout
+	if _, err := un.Run(releaseName); err != nil {
+		return fmt.Errorf("helm uninstall %q: %w", releaseName, err)
+	}
+	return nil
+}
+
 // loadChart resolves the chart from its repo (downloading into the Helm cache if needed) and loads it.
 func (m *Manager) loadChart(spec ReleaseSpec) (chart.Charter, error) {
 	cpo := action.ChartPathOptions{RepoURL: spec.RepoURL, Version: spec.Version}

@@ -27,10 +27,21 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	appsv1alpha1 "github.com/rishabht877/HelmWarden/api/v1alpha1"
 	"github.com/rishabht877/HelmWarden/internal/helm"
+)
+
+const (
+	// finalizerName gates deletion so we can uninstall the Helm release and GC the namespace first.
+	finalizerName = "apps.helmwarden.dev/finalizer"
+	// managedByAnnotation marks namespaces the operator created, so we only ever delete our own.
+	managedByAnnotation = "helmwarden.dev/managed-by"
+	managedByValue      = "operator"
+	// namespaceIndexKey indexes Applications by their target namespace for the shared-namespace guard.
+	namespaceIndexKey = "spec.namespace"
 )
 
 // ApplicationReconciler reconciles an Application object into a managed Helm release.
@@ -46,10 +57,9 @@ type ApplicationReconciler struct {
 // +kubebuilder:rbac:groups="",resources=namespaces,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch
 
-// Reconcile drives the cluster toward the desired state declared by an Application:
-// it ensures the target namespace exists, resolves any values overrides, and installs
-// or upgrades the corresponding Helm release. (Deletion, health checks, and rollback
-// are layered on in later phases.)
+// Reconcile drives the cluster toward the desired state declared by an Application: it manages a
+// finalizer, ensures the target namespace exists, resolves value overrides, and installs or
+// upgrades the corresponding Helm release. (Health checks and rollback are layered on in Phase 4.)
 func (r *ApplicationReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
 
@@ -58,15 +68,28 @@ func (r *ApplicationReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
-	// Idempotency gate: if we've already deployed this spec generation, do nothing. Without
-	// this, our own status writes re-trigger the watch and each pass runs another Helm upgrade,
-	// inflating revisions until concurrent operations collide. (Values-drift and health-driven
-	// requeues are layered on in later phases.)
+	// Deletion: run cleanup behind the finalizer.
+	if !app.DeletionTimestamp.IsZero() {
+		return r.reconcileDelete(ctx, &app)
+	}
+
+	// Register the finalizer before creating any external state. The Update re-triggers us; the
+	// next pass finds the finalizer already present and proceeds. (Finalizer changes are metadata,
+	// so they don't bump generation and won't fool the idempotency gate below.)
+	if controllerutil.AddFinalizer(&app, finalizerName) {
+		if err := r.Update(ctx, &app); err != nil {
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{}, nil
+	}
+
+	// Idempotency gate: if we've already deployed this spec generation, do nothing. Without this,
+	// our own status writes re-trigger the watch and each pass runs another Helm upgrade, inflating
+	// revisions until concurrent operations collide. (Values-drift + health requeues come later.)
 	if app.Status.ObservedGeneration == app.Generation && app.Status.Phase == appsv1alpha1.PhaseDeployed {
 		return ctrl.Result{}, nil
 	}
 
-	// Ensure the target namespace exists before Helm writes its release state into it.
 	if err := r.ensureNamespace(ctx, app.Spec.Namespace); err != nil {
 		return r.fail(ctx, &app, "NamespaceError", fmt.Errorf("ensure namespace %q: %w", app.Spec.Namespace, err))
 	}
@@ -104,7 +127,30 @@ func (r *ApplicationReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	return ctrl.Result{}, nil
 }
 
-// ensureNamespace creates the target namespace if it does not already exist.
+// reconcileDelete uninstalls the release, GCs the namespace if we own it, then drops the finalizer.
+func (r *ApplicationReconciler) reconcileDelete(ctx context.Context, app *appsv1alpha1.Application) (ctrl.Result, error) {
+	log := logf.FromContext(ctx)
+	if !controllerutil.ContainsFinalizer(app, finalizerName) {
+		return ctrl.Result{}, nil
+	}
+
+	if err := r.Helm.Uninstall(ctx, app.Name, app.Spec.Namespace); err != nil {
+		return ctrl.Result{}, fmt.Errorf("uninstall release %q: %w", app.Name, err)
+	}
+	if err := r.maybeDeleteNamespace(ctx, app); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	controllerutil.RemoveFinalizer(app, finalizerName)
+	if err := r.Update(ctx, app); err != nil {
+		return ctrl.Result{}, err
+	}
+	log.Info("finalized application", "release", app.Name, "namespace", app.Spec.Namespace)
+	return ctrl.Result{}, nil
+}
+
+// ensureNamespace creates the target namespace if absent, tagging namespaces we create with the
+// managed-by annotation so deletion can tell ours apart from pre-existing ones.
 func (r *ApplicationReconciler) ensureNamespace(ctx context.Context, name string) error {
 	var ns corev1.Namespace
 	err := r.Get(ctx, client.ObjectKey{Name: name}, &ns)
@@ -114,15 +160,60 @@ func (r *ApplicationReconciler) ensureNamespace(ctx context.Context, name string
 	if !apierrors.IsNotFound(err) {
 		return err
 	}
-	ns = corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: name}}
+	ns = corev1.Namespace{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        name,
+			Annotations: map[string]string{managedByAnnotation: managedByValue},
+		},
+	}
 	if err := r.Create(ctx, &ns); err != nil && !apierrors.IsAlreadyExists(err) {
 		return err
 	}
 	return nil
 }
 
-// resolveValues loads Helm value overrides from the referenced Secret (in the Application's
-// own namespace, to avoid a chicken-and-egg dependency on the target namespace).
+// maybeDeleteNamespace deletes the target namespace only if the operator created it (carries the
+// managed-by annotation) and no other live Application still targets it.
+func (r *ApplicationReconciler) maybeDeleteNamespace(ctx context.Context, app *appsv1alpha1.Application) error {
+	var ns corev1.Namespace
+	if err := r.Get(ctx, client.ObjectKey{Name: app.Spec.Namespace}, &ns); err != nil {
+		return client.IgnoreNotFound(err)
+	}
+	if ns.Annotations[managedByAnnotation] != managedByValue {
+		return nil
+	}
+	others, err := r.otherApplicationsInNamespace(ctx, app)
+	if err != nil {
+		return err
+	}
+	if others > 0 {
+		return nil
+	}
+	if err := r.Delete(ctx, &ns); err != nil {
+		return client.IgnoreNotFound(err)
+	}
+	return nil
+}
+
+// otherApplicationsInNamespace counts live Applications (other than app) targeting the same namespace.
+func (r *ApplicationReconciler) otherApplicationsInNamespace(ctx context.Context, app *appsv1alpha1.Application) (int, error) {
+	var list appsv1alpha1.ApplicationList
+	if err := r.List(ctx, &list, client.MatchingFields{namespaceIndexKey: app.Spec.Namespace}); err != nil {
+		return 0, err
+	}
+	count := 0
+	for i := range list.Items {
+		other := &list.Items[i]
+		if other.UID == app.UID || !other.DeletionTimestamp.IsZero() {
+			continue
+		}
+		count++
+	}
+	return count, nil
+}
+
+// resolveValues loads Helm value overrides from the referenced Secret (in the Application's own
+// namespace, to avoid a chicken-and-egg dependency on the target namespace).
 func (r *ApplicationReconciler) resolveValues(ctx context.Context, app *appsv1alpha1.Application) (map[string]any, error) {
 	ref := app.Spec.ValuesSecretRef
 	if ref == nil {
@@ -165,8 +256,14 @@ func setCondition(app *appsv1alpha1.Application, condType string, status metav1.
 	})
 }
 
-// SetupWithManager sets up the controller with the Manager.
+// SetupWithManager sets up the controller with the Manager, registering the namespace field index.
 func (r *ApplicationReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	if err := mgr.GetFieldIndexer().IndexField(context.Background(), &appsv1alpha1.Application{}, namespaceIndexKey,
+		func(o client.Object) []string {
+			return []string{o.(*appsv1alpha1.Application).Spec.Namespace}
+		}); err != nil {
+		return err
+	}
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&appsv1alpha1.Application{}).
 		Named("application").
