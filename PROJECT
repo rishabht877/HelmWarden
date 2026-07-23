@@ -6,7 +6,7 @@ cliVersion: 4.15.0
 domain: helmwarden.dev
 layout:
 - go.kubebuilder.io/v4
-projectName: kubeflow
+projectName: helmwarden
 repo: github.com/rishabht877/HelmWarden
 resources:
 - api:

@@ -1,4 +1,4 @@
-# kubeflow - AI Agent Guide
+# helmwarden - AI Agent Guide
 
 ## Project Structure
 
