@@ -37,6 +37,7 @@ import (
 
 	appsv1alpha1 "github.com/rishabht877/HelmWarden/api/v1alpha1"
 	"github.com/rishabht877/HelmWarden/internal/controller"
+	"github.com/rishabht877/HelmWarden/internal/helm"
 	// +kubebuilder:scaffold:imports
 )
 
@@ -178,9 +179,15 @@ func main() {
 		os.Exit(1)
 	}
 
+	helmManager, err := helm.NewManager(mgr.GetConfig())
+	if err != nil {
+		setupLog.Error(err, "Failed to initialize Helm manager")
+		os.Exit(1)
+	}
 	if err := (&controller.ApplicationReconciler{
 		Client: mgr.GetClient(),
 		Scheme: mgr.GetScheme(),
+		Helm:   helmManager,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Failed to create controller", "controller", "application")
 		os.Exit(1)
