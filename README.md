@@ -59,11 +59,13 @@ The original phased design lives in [`BUILD_PLAN.md`](./BUILD_PLAN.md); this REA
 
 The manager exposes custom metrics on `/metrics` (registered on controller-runtime's registry):
 `helmwarden_reconciliation_latency_seconds` (histogram), `helmwarden_deployment_success_total`
-(counter), and `helmwarden_active_managed_apps` (gauge by target namespace). A `ServiceMonitor`
-(`config/prometheus/`) lets a Prometheus Operator scrape them, and
-[`config/grafana/dashboard-configmap.yaml`](./config/grafana/dashboard-configmap.yaml) ships a Grafana
-dashboard (auto-imported by the kube-prometheus-stack sidecar).
+(counter), and `helmwarden_active_managed_apps` (gauge by target namespace).
 
-To wire it up with kube-prometheus-stack, label the `ServiceMonitor` to match your Prometheus's
-`serviceMonitorSelector` (e.g. `release: prometheus`) and grant the Prometheus ServiceAccount the
-`helmwarden-metrics-reader` ClusterRole so it can authenticate to the HTTPS metrics endpoint.
+A `ServiceMonitor` (`config/prometheus/`) and a Grafana dashboard
+([`config/grafana/dashboard-configmap.yaml`](./config/grafana/dashboard-configmap.yaml)) ship with the
+project but are **opt-in**, because the `ServiceMonitor` CRD only exists once the Prometheus Operator is
+installed. When your cluster runs kube-prometheus-stack:
+
+1. Uncomment `- ../prometheus` in [`config/default/kustomization.yaml`](./config/default/kustomization.yaml) and re-`make deploy`.
+2. Label the `ServiceMonitor` to match your Prometheus's `serviceMonitorSelector` (e.g. `release: prometheus`), and grant the Prometheus ServiceAccount the `helmwarden-metrics-reader` ClusterRole so it can authenticate to the HTTPS metrics endpoint.
+3. Apply the Grafana dashboard: `kubectl apply -n monitoring -f config/grafana/dashboard-configmap.yaml`.

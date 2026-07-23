@@ -23,8 +23,11 @@ resources:
 - ../webhook
 # [CERTMANAGER] To enable cert-manager, uncomment all sections with 'CERTMANAGER'. 'WEBHOOK' components are required.
 - ../certmanager
-# [PROMETHEUS] ServiceMonitor so a Prometheus Operator scrapes the manager's /metrics endpoint.
-- ../prometheus
+# [PROMETHEUS] Uncomment to have a Prometheus Operator scrape the manager's /metrics endpoint.
+# Left out of the default deploy because it applies a ServiceMonitor, whose CRD only exists once the
+# Prometheus Operator is installed — enabling it unconditionally breaks `make deploy` (and e2e) on
+# clusters without it. Uncomment when your cluster runs the Prometheus Operator.
+#- ../prometheus
 # [METRICS] Expose the controller manager metrics service.
 - metrics_service.yaml
 # [NETWORK POLICY] Protect the /metrics endpoint and Webhook Server with NetworkPolicy.
