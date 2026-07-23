@@ -55,17 +55,19 @@ jobs:
           key: trivy-db-${{ github.run_id }}
           restore-keys: trivy-db-
 
+      # Install Trivy from its official script rather than the marketplace action: the action pins a
+      # transitive setup-trivy sub-action whose tags drift, which broke resolution. This is stable.
+      - name: Install Trivy
+        run: |
+          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh \
+            | sh -s -- -b /usr/local/bin
+
       - name: Scan image with Trivy
-        uses: aquasecurity/trivy-action@v0.30.0
-        with:
-          image-ref: ${{ fromJSON(steps.meta.outputs.json).tags[0] }}
-          format: table
-          exit-code: "1"
-          ignore-unfixed: true
-          severity: CRITICAL
-          scanners: vuln
         env:
-          TRIVY_CACHE_DIR: ~/.cache/trivy
+          IMAGE_REF: ${{ fromJSON(steps.meta.outputs.json).tags[0] }}
+        run: |
+          trivy image --scanners vuln --ignore-unfixed --severity CRITICAL \
+            --exit-code 1 --format table "$IMAGE_REF"
 
       - name: Log in to GHCR
         if: github.event_name != 'pull_request'
