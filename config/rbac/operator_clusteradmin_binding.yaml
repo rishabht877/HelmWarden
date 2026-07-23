@@ -1,0 +1,20 @@
+# HelmWarden installs arbitrary Helm charts, which may contain any resource kind (including CRDs),
+# so the manager is bound to the built-in cluster-admin ClusterRole. This is a deliberate tradeoff
+# documented in BUILD_PLAN.md: kubebuilder RBAC markers can't express apiGroups:["*"]/resources:["*"]
+# cleanly, and scoping ahead of time isn't possible when the chart set is open-ended. In a hardened
+# deployment you'd narrow this per chart (e.g. generated Roles) or gate charts by policy.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  labels:
+    app.kubernetes.io/name: helmwarden
+    app.kubernetes.io/managed-by: kustomize
+  name: manager-clusteradmin-binding
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: cluster-admin
+subjects:
+- kind: ServiceAccount
+  name: controller-manager
+  namespace: system
