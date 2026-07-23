@@ -2,8 +2,19 @@ apiVersion: apps.helmwarden.dev/v1alpha1
 kind: Application
 metadata:
   labels:
-    app.kubernetes.io/name: kubeflow
+    app.kubernetes.io/name: helmwarden
     app.kubernetes.io/managed-by: kustomize
   name: application-sample
 spec:
-  # TODO(user): Add fields here
+  # Chart to deploy, from a Helm repository.
+  chartName: podinfo
+  repoURL: https://stefanprodan.github.io/podinfo
+  version: 6.7.1
+  # Target namespace; created and managed by the operator if absent.
+  namespace: demo
+  # Optional Secret (in this Application's namespace) holding a values.yaml override document.
+  # valuesSecretRef:
+  #   name: podinfo-values
+  #   key: values.yaml
+  # How long to wait for workloads to become healthy before rolling back.
+  progressDeadlineSeconds: 300

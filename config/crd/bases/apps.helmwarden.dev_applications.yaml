@@ -14,10 +14,26 @@ spec:
     singular: application
   scope: Namespaced
   versions:
-  - name: v1alpha1
+  - additionalPrinterColumns:
+    - jsonPath: .status.phase
+      name: Phase
+      type: string
+    - jsonPath: .spec.chartName
+      name: Chart
+      type: string
+    - jsonPath: .status.helmRevision
+      name: Revision
+      type: integer
+    - jsonPath: .status.conditions[?(@.type=="Ready")].status
+      name: Ready
+      type: string
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
     schema:
       openAPIV3Schema:
-        description: Application is the Schema for the applications API
+        description: Application is the Schema for the applications API.
         properties:
           apiVersion:
             description: |-
@@ -39,10 +55,58 @@ spec:
           spec:
             description: spec defines the desired state of Application
             properties:
-              foo:
-                description: foo is an example field of Application. Edit application_types.go
-                  to remove/update
+              chartName:
+                description: chartName is the name of the Helm chart to deploy (e.g.
+                  "nginx").
+                minLength: 1
                 type: string
+              namespace:
+                description: |-
+                  namespace is the target namespace for the Helm release. Created and managed by the
+                  operator if absent.
+                minLength: 1
+                type: string
+              progressDeadlineSeconds:
+                default: 300
+                description: |-
+                  progressDeadlineSeconds is how long to wait for the release to become healthy before treating the
+                  rollout as failed and triggering a rollback. Defaults to 300.
+                format: int32
+                minimum: 10
+                type: integer
+              repoURL:
+                description: repoURL is the Helm chart repository URL hosting the
+                  chart.
+                minLength: 1
+                type: string
+              valuesSecretRef:
+                description: |-
+                  valuesSecretRef optionally references a Secret (in the Application's namespace) whose key holds
+                  Helm value overrides as a values.yaml document.
+                properties:
+                  key:
+                    default: values.yaml
+                    description: key is the Secret data key holding a full values.yaml
+                      document.
+                    type: string
+                  name:
+                    description: name is the Secret name, resolved in the Application's
+                      own namespace.
+                    minLength: 1
+                    type: string
+                required:
+                - name
+                type: object
+              version:
+                description: version is the chart version to deploy. Must be valid
+                  semver (enforced by the admission webhook).
+                minLength: 1
+                type: string
+            required:
+            - chartName
+            - namespace
+            - repoURL
+            - version
             type: object
           status:
             description: status defines the observed state of Application
@@ -50,14 +114,7 @@ spec:
               conditions:
                 description: |-
                   conditions represent the current state of the Application resource.
-                  Each condition has a unique type and reflects the status of a specific aspect of the resource.
-
-                  Standard condition types include:
-                  - "Available": the resource is fully functional
-                  - "Progressing": the resource is being created or updated
-                  - "Degraded": the resource failed to reach or maintain its desired state
-
-                  The status of each condition is one of True, False, or Unknown.
+                  Types: "Released", "Healthy", "Ready".
                 items:
                   description: Condition contains details for one aspect of the current
                     state of this API Resource.
@@ -116,6 +173,43 @@ spec:
                 x-kubernetes-list-map-keys:
                 - type
                 x-kubernetes-list-type: map
+              helmReleaseName:
+                description: helmReleaseName is the name of the managed Helm release.
+                type: string
+              helmRevision:
+                description: helmRevision mirrors the current Helm release revision
+                  (cross-checkable with `helm history`).
+                type: integer
+              lastAppliedValuesHash:
+                description: lastAppliedValuesHash is a hash of the values last applied,
+                  used to short-circuit no-op upgrades.
+                type: string
+              lastDeployStartTime:
+                description: lastDeployStartTime marks when the most recent install/upgrade
+                  began, used for the progress deadline.
+                format: date-time
+                type: string
+              lastFailedRevision:
+                description: |-
+                  lastFailedRevision records the last release revision that failed health checks, to prevent
+                  rollback thrash.
+                type: integer
+              observedGeneration:
+                description: observedGeneration is the .metadata.generation the controller
+                  last reconciled.
+                format: int64
+                type: integer
+              phase:
+                description: phase is a high-level summary of the Application lifecycle
+                  state.
+                enum:
+                - Pending
+                - Deploying
+                - Deployed
+                - Degraded
+                - RollingBack
+                - Failed
+                type: string
             type: object
         required:
         - spec

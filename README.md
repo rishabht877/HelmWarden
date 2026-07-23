@@ -1,135 +1,56 @@
-# kubeflow
-// TODO(user): Add simple overview of use/purpose
+# HelmWarden
 
-## Description
-// TODO(user): An in-depth paragraph about your project and overview of use
+A Kubernetes operator that turns Helm releases into declarative, self-healing custom resources.
 
-## Getting Started
+Declare an `Application` — a chart, a repo, a version, a target namespace — and HelmWarden reconciles the cluster to match: installing or upgrading the Helm release, creating and owning the target namespace, watching the rolled-out workloads for health, and automatically rolling back to the last good revision when a release goes unhealthy.
 
-### Prerequisites
-- go version v1.24.6+
-- docker version 17.03+.
-- kubectl version v1.11.3+.
-- Access to a Kubernetes v1.11.3+ cluster.
+Built with [kubebuilder](https://book.kubebuilder.io/) v4 / controller-runtime and the Helm Go SDK.
 
-### To Deploy on the cluster
-**Build and push your image to the location specified by `IMG`:**
+## Why
 
-```sh
-make docker-build docker-push IMG=<some-registry>/kubeflow:tag
+`helm upgrade` is imperative and stateless — nothing reconciles drift, nothing rolls back a bad release on its own, and there's no CRD-native way to express "this chart should be running, at this version, here." HelmWarden closes that gap: a Helm release becomes a Kubernetes object with a spec, a status, conditions, and a controller that continuously drives toward desired state.
+
+## The `Application` API
+
+```yaml
+apiVersion: apps.helmwarden.dev/v1alpha1
+kind: Application
+metadata:
+  name: podinfo
+spec:
+  chartName: podinfo
+  repoURL: https://stefanprodan.github.io/podinfo
+  version: 6.7.1              # must be valid semver (enforced by the admission webhook)
+  namespace: demo            # created + owned by the operator if absent
+  valuesSecretRef:           # optional Helm value overrides
+    name: podinfo-values
+    key: values.yaml         # defaults to "values.yaml"
+  progressDeadlineSeconds: 300
 ```
 
-**NOTE:** This image ought to be published in the personal registry you specified.
-And it is required to have access to pull the image from the working environment.
-Make sure you have the proper permission to the registry if the above commands don’t work.
+`status` reports a `phase` (`Pending` → `Deploying` → `Deployed` / `Degraded` / `Failed`), standard `conditions` (`Released`, `Healthy`, `Ready`), the live `helmRevision`, and bookkeeping used for idempotent reconciles and rollback anti-thrash.
 
-**Install the CRDs into the cluster:**
+## Quickstart (local, kind)
 
 ```sh
+# 1. Cluster + CRDs
+kind create cluster --name app-operator
 make install
+
+# 2. Run the controller against the cluster
+make run
+
+# 3. Apply a sample Application
+kubectl apply -f config/samples/apps_v1alpha1_application.yaml
+kubectl get applications
 ```
 
-**Deploy the Manager to the cluster with the image specified by `IMG`:**
+## Status / roadmap
 
-```sh
-make deploy IMG=<some-registry>/kubeflow:tag
-```
+- [x] **Phase 1** — CRD + scaffolding (`Application` types, status subresource, printer columns)
+- [ ] **Phase 2** — Helm reconciliation (install/upgrade, finalizer cleanup, namespace ownership, idempotency)
+- [ ] **Phase 3** — validating admission webhook (semver / values / namespace), cert-manager TLS
+- [ ] **Phase 4** — health-based automated rollback + CI (Trivy, GHCR)
+- [ ] **Phase 5** — Prometheus metrics + Grafana dashboard (ServiceMonitor)
 
-> **NOTE**: If you encounter RBAC errors, you may need to grant yourself cluster-admin
-privileges or be logged in as admin.
-
-**Create instances of your solution**
-You can apply the samples (examples) from the config/sample:
-
-```sh
-kubectl apply -k config/samples/
-```
-
->**NOTE**: Ensure that the samples has default values to test it out.
-
-### To Uninstall
-**Delete the instances (CRs) from the cluster:**
-
-```sh
-kubectl delete -k config/samples/
-```
-
-**Delete the APIs(CRDs) from the cluster:**
-
-```sh
-make uninstall
-```
-
-**UnDeploy the controller from the cluster:**
-
-```sh
-make undeploy
-```
-
-## Project Distribution
-
-Following the options to release and provide this solution to the users.
-
-### By providing a bundle with all YAML files
-
-1. Build the installer for the image built and published in the registry:
-
-```sh
-make build-installer IMG=<some-registry>/kubeflow:tag
-```
-
-**NOTE:** The makefile target mentioned above generates an 'install.yaml'
-file in the dist directory. This file contains all the resources built
-with Kustomize, which are necessary to install this project without its
-dependencies.
-
-2. Using the installer
-
-Users can just run 'kubectl apply -f <URL for YAML BUNDLE>' to install
-the project, i.e.:
-
-```sh
-kubectl apply -f https://raw.githubusercontent.com/<org>/kubeflow/<tag or branch>/dist/install.yaml
-```
-
-### By providing a Helm Chart
-
-1. Build the chart using the optional helm plugin
-
-```sh
-kubebuilder edit --plugins=helm/v2-alpha
-```
-
-2. See that a chart was generated under 'dist/chart', and users
-can obtain this solution from there.
-
-**NOTE:** If you change the project, you need to update the Helm Chart
-using the same command above to sync the latest changes. Furthermore,
-if you create webhooks, you need to use the above command with
-the '--force' flag and manually ensure that any custom configuration
-previously added to 'dist/chart/values.yaml' or 'dist/chart/manager/manager.yaml'
-is manually re-applied afterwards.
-
-## Contributing
-// TODO(user): Add detailed information on how you would like others to contribute to this project
-
-**NOTE:** Run `make help` for more information on all potential `make` targets
-
-More information can be found via the [Kubebuilder Documentation](https://book.kubebuilder.io/introduction.html)
-
-## License
-
-Copyright 2026.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-
+The original phased design lives in [`BUILD_PLAN.md`](./BUILD_PLAN.md); this README tracks the current state.

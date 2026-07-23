@@ -21,48 +21,132 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 )
 
-// EDIT THIS FILE!  THIS IS SCAFFOLDING FOR YOU TO OWN!
-// NOTE: json tags are required.  Any new fields you add must have json tags for the fields to be serialized.
+// ApplicationPhase is a high-level summary of where an Application is in its lifecycle.
+// +kubebuilder:validation:Enum=Pending;Deploying;Deployed;Degraded;RollingBack;Failed
+type ApplicationPhase string
 
-// ApplicationSpec defines the desired state of Application
-type ApplicationSpec struct {
-	// INSERT ADDITIONAL SPEC FIELDS - desired state of cluster
-	// Important: Run "make" to regenerate code after modifying this file
-	// The following markers will use OpenAPI v3 schema to validate the value
-	// More info: https://book.kubebuilder.io/reference/markers/crd-validation.html
+const (
+	// PhasePending means the Application has been accepted but no Helm action has run yet.
+	PhasePending ApplicationPhase = "Pending"
+	// PhaseDeploying means a Helm install/upgrade has run and workloads are converging.
+	PhaseDeploying ApplicationPhase = "Deploying"
+	// PhaseDeployed means the release is installed and all workloads are healthy.
+	PhaseDeployed ApplicationPhase = "Deployed"
+	// PhaseDegraded means the release is installed but workloads are unhealthy (post-rollback or awaiting fix).
+	PhaseDegraded ApplicationPhase = "Degraded"
+	// PhaseRollingBack means an unhealthy rollout is being rolled back to the previous good revision.
+	PhaseRollingBack ApplicationPhase = "RollingBack"
+	// PhaseFailed means the release could not be reconciled and no rollback target exists.
+	PhaseFailed ApplicationPhase = "Failed"
+)
 
-	// foo is an example field of Application. Edit application_types.go to remove/update
+// Condition types set on an Application's status.
+const (
+	// ConditionReleased is True once the Helm install/upgrade has succeeded.
+	ConditionReleased = "Released"
+	// ConditionHealthy is True once all workloads in the release report Current.
+	ConditionHealthy = "Healthy"
+	// ConditionReady is the roll-up: True when the Application is fully deployed and healthy.
+	ConditionReady = "Ready"
+)
+
+// ValuesSecretRef references a Secret holding Helm values overrides.
+type ValuesSecretRef struct {
+	// name is the Secret name, resolved in the Application's own namespace.
+	// +required
+	// +kubebuilder:validation:MinLength=1
+	Name string `json:"name"`
+
+	// key is the Secret data key holding a full values.yaml document.
+	// +kubebuilder:default=values.yaml
 	// +optional
-	Foo *string `json:"foo,omitempty"`
+	Key string `json:"key,omitempty"`
+}
+
+// ApplicationSpec defines the desired state of Application.
+type ApplicationSpec struct {
+	// chartName is the name of the Helm chart to deploy (e.g. "nginx").
+	// +required
+	// +kubebuilder:validation:MinLength=1
+	ChartName string `json:"chartName"`
+
+	// repoURL is the Helm chart repository URL hosting the chart.
+	// +required
+	// +kubebuilder:validation:MinLength=1
+	RepoURL string `json:"repoURL"`
+
+	// version is the chart version to deploy. Must be valid semver (enforced by the admission webhook).
+	// +required
+	// +kubebuilder:validation:MinLength=1
+	Version string `json:"version"`
+
+	// namespace is the target namespace for the Helm release. Created and managed by the
+	// operator if absent.
+	// +required
+	// +kubebuilder:validation:MinLength=1
+	Namespace string `json:"namespace"`
+
+	// valuesSecretRef optionally references a Secret (in the Application's namespace) whose key holds
+	// Helm value overrides as a values.yaml document.
+	// +optional
+	ValuesSecretRef *ValuesSecretRef `json:"valuesSecretRef,omitempty"`
+
+	// progressDeadlineSeconds is how long to wait for the release to become healthy before treating the
+	// rollout as failed and triggering a rollback. Defaults to 300.
+	// +kubebuilder:default=300
+	// +kubebuilder:validation:Minimum=10
+	// +optional
+	ProgressDeadlineSeconds int32 `json:"progressDeadlineSeconds,omitempty"`
 }
 
 // ApplicationStatus defines the observed state of Application.
 type ApplicationStatus struct {
-	// INSERT ADDITIONAL STATUS FIELD - define observed state of cluster
-	// Important: Run "make" to regenerate code after modifying this file
-
-	// For Kubernetes API conventions, see:
-	// https://github.com/kubernetes/community/blob/master/contributors/devel/sig-architecture/api-conventions.md#typical-status-properties
+	// phase is a high-level summary of the Application lifecycle state.
+	// +optional
+	Phase ApplicationPhase `json:"phase,omitempty"`
 
 	// conditions represent the current state of the Application resource.
-	// Each condition has a unique type and reflects the status of a specific aspect of the resource.
-	//
-	// Standard condition types include:
-	// - "Available": the resource is fully functional
-	// - "Progressing": the resource is being created or updated
-	// - "Degraded": the resource failed to reach or maintain its desired state
-	//
-	// The status of each condition is one of True, False, or Unknown.
+	// Types: "Released", "Healthy", "Ready".
 	// +listType=map
 	// +listMapKey=type
 	// +optional
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
+
+	// observedGeneration is the .metadata.generation the controller last reconciled.
+	// +optional
+	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
+
+	// helmReleaseName is the name of the managed Helm release.
+	// +optional
+	HelmReleaseName string `json:"helmReleaseName,omitempty"`
+
+	// helmRevision mirrors the current Helm release revision (cross-checkable with `helm history`).
+	// +optional
+	HelmRevision int `json:"helmRevision,omitempty"`
+
+	// lastAppliedValuesHash is a hash of the values last applied, used to short-circuit no-op upgrades.
+	// +optional
+	LastAppliedValuesHash string `json:"lastAppliedValuesHash,omitempty"`
+
+	// lastFailedRevision records the last release revision that failed health checks, to prevent
+	// rollback thrash.
+	// +optional
+	LastFailedRevision int `json:"lastFailedRevision,omitempty"`
+
+	// lastDeployStartTime marks when the most recent install/upgrade began, used for the progress deadline.
+	// +optional
+	LastDeployStartTime *metav1.Time `json:"lastDeployStartTime,omitempty"`
 }
 
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
+// +kubebuilder:printcolumn:name="Phase",type=string,JSONPath=`.status.phase`
+// +kubebuilder:printcolumn:name="Chart",type=string,JSONPath=`.spec.chartName`
+// +kubebuilder:printcolumn:name="Revision",type=integer,JSONPath=`.status.helmRevision`
+// +kubebuilder:printcolumn:name="Ready",type=string,JSONPath=`.status.conditions[?(@.type=="Ready")].status`
+// +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`
 
-// Application is the Schema for the applications API
+// Application is the Schema for the applications API.
 type Application struct {
 	metav1.TypeMeta `json:",inline"`
 
@@ -81,7 +165,7 @@ type Application struct {
 
 // +kubebuilder:object:root=true
 
-// ApplicationList contains a list of Application
+// ApplicationList contains a list of Application.
 type ApplicationList struct {
 	metav1.TypeMeta `json:",inline"`
 	metav1.ListMeta `json:"metadata,omitzero"`
