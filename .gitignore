@@ -1,0 +1,28 @@
+# Binaries / build output
+bin/
+testbin/
+*.exe
+*.dll
+*.so
+*.dylib
+Dockerfile.cross
+
+# Test & coverage
+*.test
+cover.out
+cover.html
+*.out
+
+# Go workspace
+go.work
+go.work.sum
+
+# Editor / OS
+.DS_Store
+*.swp
+*~
+.idea/
+.vscode/
+
+# Local tooling / session state
+.claude/
