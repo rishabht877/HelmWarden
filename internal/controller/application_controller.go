@@ -18,6 +18,8 @@ package controller
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 
 	corev1 "k8s.io/api/core/v1"
@@ -25,10 +27,13 @@ import (
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	appsv1alpha1 "github.com/rishabht877/HelmWarden/api/v1alpha1"
 	"github.com/rishabht877/HelmWarden/internal/helm"
@@ -40,8 +45,11 @@ const (
 	// managedByAnnotation marks namespaces the operator created, so we only ever delete our own.
 	managedByAnnotation = "helmwarden.dev/managed-by"
 	managedByValue      = "operator"
-	// namespaceIndexKey indexes Applications by their target namespace for the shared-namespace guard.
+	// namespaceIndexKey indexes Applications by target namespace for the shared-namespace guard.
 	namespaceIndexKey = "spec.namespace"
+	// secretRefIndexKey indexes Applications by their values Secret name so a Secret change can be
+	// mapped back to the Applications that consume it.
+	secretRefIndexKey = "spec.valuesSecretRef.name"
 )
 
 // ApplicationReconciler reconciles an Application object into a managed Helm release.
@@ -83,20 +91,24 @@ func (r *ApplicationReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		return ctrl.Result{}, nil
 	}
 
-	// Idempotency gate: if we've already deployed this spec generation, do nothing. Without this,
-	// our own status writes re-trigger the watch and each pass runs another Helm upgrade, inflating
-	// revisions until concurrent operations collide. (Values-drift + health requeues come later.)
-	if app.Status.ObservedGeneration == app.Generation && app.Status.Phase == appsv1alpha1.PhaseDeployed {
+	// Resolve values first so we can hash them: a change to the values Secret must re-trigger an
+	// upgrade even though the Application's spec generation is unchanged.
+	values, valuesHash, err := r.resolveValues(ctx, &app)
+	if err != nil {
+		return r.fail(ctx, &app, "ValuesError", err)
+	}
+
+	// Idempotency gate: skip when we've already deployed this spec generation AND the values are
+	// unchanged AND the release is healthy. Without this, our own status writes re-trigger the
+	// watch and each pass runs another Helm upgrade, inflating revisions until they collide.
+	if app.Status.ObservedGeneration == app.Generation &&
+		app.Status.Phase == appsv1alpha1.PhaseDeployed &&
+		app.Status.LastAppliedValuesHash == valuesHash {
 		return ctrl.Result{}, nil
 	}
 
 	if err := r.ensureNamespace(ctx, app.Spec.Namespace); err != nil {
 		return r.fail(ctx, &app, "NamespaceError", fmt.Errorf("ensure namespace %q: %w", app.Spec.Namespace, err))
-	}
-
-	values, err := r.resolveValues(ctx, &app)
-	if err != nil {
-		return r.fail(ctx, &app, "ValuesError", err)
 	}
 
 	log.Info("reconciling release", "chart", app.Spec.ChartName, "version", app.Spec.Version, "namespace", app.Spec.Namespace)
@@ -115,6 +127,7 @@ func (r *ApplicationReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	app.Status.HelmReleaseName = res.Name
 	app.Status.HelmRevision = res.Revision
 	app.Status.ObservedGeneration = app.Generation
+	app.Status.LastAppliedValuesHash = valuesHash
 	app.Status.Phase = appsv1alpha1.PhaseDeployed
 	setCondition(&app, appsv1alpha1.ConditionReleased, metav1.ConditionTrue, "ReleaseApplied",
 		fmt.Sprintf("release %q at revision %d (%s)", res.Name, res.Revision, res.Status))
@@ -213,11 +226,11 @@ func (r *ApplicationReconciler) otherApplicationsInNamespace(ctx context.Context
 }
 
 // resolveValues loads Helm value overrides from the referenced Secret (in the Application's own
-// namespace, to avoid a chicken-and-egg dependency on the target namespace).
-func (r *ApplicationReconciler) resolveValues(ctx context.Context, app *appsv1alpha1.Application) (map[string]any, error) {
+// namespace) and returns them along with a hash of the raw document used to detect drift.
+func (r *ApplicationReconciler) resolveValues(ctx context.Context, app *appsv1alpha1.Application) (map[string]any, string, error) {
 	ref := app.Spec.ValuesSecretRef
 	if ref == nil {
-		return nil, nil
+		return nil, "", nil
 	}
 	key := ref.Key
 	if key == "" {
@@ -225,13 +238,38 @@ func (r *ApplicationReconciler) resolveValues(ctx context.Context, app *appsv1al
 	}
 	var secret corev1.Secret
 	if err := r.Get(ctx, client.ObjectKey{Namespace: app.Namespace, Name: ref.Name}, &secret); err != nil {
-		return nil, fmt.Errorf("get values secret %q: %w", ref.Name, err)
+		return nil, "", fmt.Errorf("get values secret %q: %w", ref.Name, err)
 	}
 	raw, ok := secret.Data[key]
 	if !ok {
-		return nil, fmt.Errorf("values secret %q has no key %q", ref.Name, key)
+		return nil, "", fmt.Errorf("values secret %q has no key %q", ref.Name, key)
 	}
-	return helm.ParseValues(raw)
+	vals, err := helm.ParseValues(raw)
+	if err != nil {
+		return nil, "", err
+	}
+	sum := sha256.Sum256(raw)
+	return vals, hex.EncodeToString(sum[:]), nil
+}
+
+// applicationsForSecret maps a changed Secret to the Applications that reference it (same namespace,
+// matching values-Secret name), so editing the values Secret re-triggers a reconcile even though
+// the Application's own spec is unchanged.
+func (r *ApplicationReconciler) applicationsForSecret(ctx context.Context, obj client.Object) []reconcile.Request {
+	var list appsv1alpha1.ApplicationList
+	if err := r.List(ctx, &list,
+		client.InNamespace(obj.GetNamespace()),
+		client.MatchingFields{secretRefIndexKey: obj.GetName()}); err != nil {
+		return nil
+	}
+	reqs := make([]reconcile.Request, 0, len(list.Items))
+	for i := range list.Items {
+		app := &list.Items[i]
+		reqs = append(reqs, reconcile.Request{
+			NamespacedName: types.NamespacedName{Namespace: app.Namespace, Name: app.Name},
+		})
+	}
+	return reqs
 }
 
 // fail records a failure on status and returns the causing error so the request is requeued.
@@ -256,7 +294,11 @@ func setCondition(app *appsv1alpha1.Application, condType string, status metav1.
 	})
 }
 
-// SetupWithManager sets up the controller with the Manager, registering the namespace field index.
+// SetupWithManager wires up the controller, its field indexes, and a watch that re-enqueues an
+// Application when its values Secret changes.
+//
+// NOTE: watching Secrets sets up a cluster-wide Secret informer. That's fine here; in a large
+// multi-tenant cluster I'd scope the cache to labeled Secrets to bound memory.
 func (r *ApplicationReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	if err := mgr.GetFieldIndexer().IndexField(context.Background(), &appsv1alpha1.Application{}, namespaceIndexKey,
 		func(o client.Object) []string {
@@ -264,8 +306,19 @@ func (r *ApplicationReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		}); err != nil {
 		return err
 	}
+	if err := mgr.GetFieldIndexer().IndexField(context.Background(), &appsv1alpha1.Application{}, secretRefIndexKey,
+		func(o client.Object) []string {
+			app := o.(*appsv1alpha1.Application)
+			if app.Spec.ValuesSecretRef != nil && app.Spec.ValuesSecretRef.Name != "" {
+				return []string{app.Spec.ValuesSecretRef.Name}
+			}
+			return nil
+		}); err != nil {
+		return err
+	}
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&appsv1alpha1.Application{}).
+		Watches(&corev1.Secret{}, handler.EnqueueRequestsFromMapFunc(r.applicationsForSecret)).
 		Named("application").
 		Complete(r)
 }
