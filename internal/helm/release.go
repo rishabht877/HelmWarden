@@ -117,6 +117,20 @@ func (m *Manager) InstallOrUpgrade(ctx context.Context, spec ReleaseSpec) (*Rele
 	return toResult(raw)
 }
 
+// Get returns the current state of a release, including its rendered manifest (used to enumerate
+// workloads for health checks). It errors if the release does not exist.
+func (m *Manager) Get(_ context.Context, releaseName, namespace string) (*ReleaseResult, error) {
+	cfg, err := m.newActionConfig(namespace)
+	if err != nil {
+		return nil, err
+	}
+	raw, err := action.NewGet(cfg).Run(releaseName)
+	if err != nil {
+		return nil, fmt.Errorf("helm get %q: %w", releaseName, err)
+	}
+	return toResult(raw)
+}
+
 // Uninstall removes the release if it exists. It is a no-op when the release is already gone,
 // so it is safe to call repeatedly from a finalizer.
 func (m *Manager) Uninstall(_ context.Context, releaseName, namespace string) error {

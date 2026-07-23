@@ -21,6 +21,8 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"reflect"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -28,6 +30,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/cli-utils/pkg/kstatus/status"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -37,6 +40,14 @@ import (
 
 	appsv1alpha1 "github.com/rishabht877/HelmWarden/api/v1alpha1"
 	"github.com/rishabht877/HelmWarden/internal/helm"
+)
+
+const (
+	// healthPollInterval is how often we re-check workload health during an active rollout.
+	healthPollInterval = 30 * time.Second
+	// steadyPollInterval is the slower cadence for ongoing health monitoring once a release is
+	// healthy, so a release that degrades later is still eventually noticed (and rolled back).
+	steadyPollInterval = 5 * time.Minute
 )
 
 const (
@@ -91,53 +102,109 @@ func (r *ApplicationReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		return ctrl.Result{}, nil
 	}
 
-	// Resolve values first so we can hash them: a change to the values Secret must re-trigger an
-	// upgrade even though the Application's spec generation is unchanged.
+	// Resolve values first so we can hash them: a change to the values Secret must re-apply the
+	// release even though the Application's spec generation is unchanged.
 	values, valuesHash, err := r.resolveValues(ctx, &app)
 	if err != nil {
 		return r.fail(ctx, &app, "ValuesError", err)
 	}
 
-	// Idempotency gate: skip when we've already deployed this spec generation AND the values are
-	// unchanged AND the release is healthy. Without this, our own status writes re-trigger the
-	// watch and each pass runs another Helm upgrade, inflating revisions until they collide.
-	if app.Status.ObservedGeneration == app.Generation &&
-		app.Status.Phase == appsv1alpha1.PhaseDeployed &&
-		app.Status.LastAppliedValuesHash == valuesHash {
-		return ctrl.Result{}, nil
+	// Has the desired state changed (new spec generation or new values)? If so, run an
+	// install/upgrade. Otherwise the release is already applied and we only evaluate its health.
+	// This split is what stops our own status writes from re-running Helm every reconcile.
+	needsApply := app.Status.ObservedGeneration != app.Generation ||
+		app.Status.LastAppliedValuesHash != valuesHash
+
+	if needsApply {
+		if err := r.ensureNamespace(ctx, app.Spec.Namespace); err != nil {
+			return r.fail(ctx, &app, "NamespaceError", fmt.Errorf("ensure namespace %q: %w", app.Spec.Namespace, err))
+		}
+		log.Info("applying release", "chart", app.Spec.ChartName, "version", app.Spec.Version, "namespace", app.Spec.Namespace)
+		res, err := r.Helm.InstallOrUpgrade(ctx, helm.ReleaseSpec{
+			ReleaseName: app.Name,
+			ChartName:   app.Spec.ChartName,
+			RepoURL:     app.Spec.RepoURL,
+			Version:     app.Spec.Version,
+			Namespace:   app.Spec.Namespace,
+			Values:      values,
+		})
+		if err != nil {
+			return r.fail(ctx, &app, "HelmError", err)
+		}
+		now := metav1.Now()
+		app.Status.HelmReleaseName = res.Name
+		app.Status.HelmRevision = res.Revision
+		app.Status.ObservedGeneration = app.Generation
+		app.Status.LastAppliedValuesHash = valuesHash
+		app.Status.LastDeployStartTime = &now
+		app.Status.Phase = appsv1alpha1.PhaseDeploying
+		setCondition(&app, appsv1alpha1.ConditionReleased, metav1.ConditionTrue, "ReleaseApplied",
+			fmt.Sprintf("release %q at revision %d", res.Name, res.Revision))
+		setCondition(&app, appsv1alpha1.ConditionReady, metav1.ConditionFalse, "Progressing", "release applied, waiting for workloads")
+		if err := r.Status().Update(ctx, &app); err != nil {
+			return ctrl.Result{}, err
+		}
+		log.Info("release applied", "release", res.Name, "revision", res.Revision)
+		return ctrl.Result{RequeueAfter: healthPollInterval}, nil
 	}
 
-	if err := r.ensureNamespace(ctx, app.Spec.Namespace); err != nil {
-		return r.fail(ctx, &app, "NamespaceError", fmt.Errorf("ensure namespace %q: %w", app.Spec.Namespace, err))
-	}
+	// Already applied this spec+values — evaluate workload health and drive the phase.
+	return r.reconcileHealth(ctx, &app)
+}
 
-	log.Info("reconciling release", "chart", app.Spec.ChartName, "version", app.Spec.Version, "namespace", app.Spec.Namespace)
-	res, err := r.Helm.InstallOrUpgrade(ctx, helm.ReleaseSpec{
-		ReleaseName: app.Name,
-		ChartName:   app.Spec.ChartName,
-		RepoURL:     app.Spec.RepoURL,
-		Version:     app.Spec.Version,
-		Namespace:   app.Spec.Namespace,
-		Values:      values,
-	})
+// reconcileHealth reads the release's workloads, computes an aggregate kstatus, and updates the
+// Application phase accordingly. Because Helm-created resources carry no owner reference back to the
+// Application, an Owns() watch would never fire — so health is polled via RequeueAfter instead.
+func (r *ApplicationReconciler) reconcileHealth(ctx context.Context, app *appsv1alpha1.Application) (ctrl.Result, error) {
+	log := logf.FromContext(ctx)
+
+	rel, err := r.Helm.Get(ctx, app.Name, app.Spec.Namespace)
 	if err != nil {
-		return r.fail(ctx, &app, "HelmError", err)
+		return ctrl.Result{}, fmt.Errorf("get release %q: %w", app.Name, err)
 	}
-
-	app.Status.HelmReleaseName = res.Name
-	app.Status.HelmRevision = res.Revision
-	app.Status.ObservedGeneration = app.Generation
-	app.Status.LastAppliedValuesHash = valuesHash
-	app.Status.Phase = appsv1alpha1.PhaseDeployed
-	setCondition(&app, appsv1alpha1.ConditionReleased, metav1.ConditionTrue, "ReleaseApplied",
-		fmt.Sprintf("release %q at revision %d (%s)", res.Name, res.Revision, res.Status))
-	setCondition(&app, appsv1alpha1.ConditionReady, metav1.ConditionTrue, "Deployed", "release deployed")
-	if err := r.Status().Update(ctx, &app); err != nil {
+	health, detail, err := r.releaseHealth(ctx, rel.Manifest, app.Spec.Namespace)
+	if err != nil {
 		return ctrl.Result{}, err
 	}
 
-	log.Info("release applied", "release", res.Name, "revision", res.Revision, "status", res.Status)
-	return ctrl.Result{}, nil
+	before := app.Status.DeepCopy()
+	var result ctrl.Result
+
+	switch {
+	case health == status.CurrentStatus:
+		app.Status.Phase = appsv1alpha1.PhaseDeployed
+		setCondition(app, appsv1alpha1.ConditionHealthy, metav1.ConditionTrue, "AllWorkloadsCurrent", detail)
+		setCondition(app, appsv1alpha1.ConditionReady, metav1.ConditionTrue, "Deployed", "release deployed and healthy")
+		result = ctrl.Result{RequeueAfter: steadyPollInterval}
+
+	case health == status.FailedStatus || deadlineExceeded(app):
+		reason, msg := "WorkloadFailed", detail
+		if health != status.FailedStatus {
+			reason = "ProgressDeadlineExceeded"
+			msg = fmt.Sprintf("workloads not ready within %ds", app.Spec.ProgressDeadlineSeconds)
+		}
+		// Phase 4b turns this branch into an automated rollback; for now we surface Degraded.
+		app.Status.Phase = appsv1alpha1.PhaseDegraded
+		setCondition(app, appsv1alpha1.ConditionHealthy, metav1.ConditionFalse, reason, msg)
+		setCondition(app, appsv1alpha1.ConditionReady, metav1.ConditionFalse, "Degraded", msg)
+		result = ctrl.Result{RequeueAfter: steadyPollInterval}
+
+	default: // InProgress / NotFound
+		app.Status.Phase = appsv1alpha1.PhaseDeploying
+		setCondition(app, appsv1alpha1.ConditionHealthy, metav1.ConditionFalse, "Progressing", detail)
+		setCondition(app, appsv1alpha1.ConditionReady, metav1.ConditionFalse, "Progressing", detail)
+		result = ctrl.Result{RequeueAfter: healthPollInterval}
+	}
+
+	// Only write status when something actually changed, so steady-state polling doesn't churn
+	// the object (which would re-trigger the watch and defeat the point of the poll interval).
+	if !reflect.DeepEqual(before, &app.Status) {
+		if err := r.Status().Update(ctx, app); err != nil {
+			return ctrl.Result{}, err
+		}
+		log.Info("health evaluated", "phase", app.Status.Phase, "detail", detail)
+	}
+	return result, nil
 }
 
 // reconcileDelete uninstalls the release, GCs the namespace if we own it, then drops the finalizer.
@@ -284,10 +351,10 @@ func (r *ApplicationReconciler) fail(ctx context.Context, app *appsv1alpha1.Appl
 }
 
 // setCondition upserts a status condition, stamping it with the current generation.
-func setCondition(app *appsv1alpha1.Application, condType string, status metav1.ConditionStatus, reason, msg string) {
+func setCondition(app *appsv1alpha1.Application, condType string, condStatus metav1.ConditionStatus, reason, msg string) {
 	apimeta.SetStatusCondition(&app.Status.Conditions, metav1.Condition{
 		Type:               condType,
-		Status:             status,
+		Status:             condStatus,
 		Reason:             reason,
 		Message:            msg,
 		ObservedGeneration: app.Generation,
