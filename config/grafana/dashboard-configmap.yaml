@@ -1,0 +1,92 @@
+# Grafana dashboard for HelmWarden. Labeled so the kube-prometheus-stack Grafana sidecar
+# auto-imports it. Apply into the namespace your Grafana sidecar watches (often "monitoring"):
+#   kubectl apply -n monitoring -f config/grafana/dashboard-configmap.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: helmwarden-grafana-dashboard
+  labels:
+    grafana_dashboard: "1"
+    app.kubernetes.io/name: helmwarden
+data:
+  helmwarden.json: |
+    {
+      "title": "HelmWarden Operator",
+      "uid": "helmwarden-operator",
+      "schemaVersion": 39,
+      "editable": true,
+      "time": { "from": "now-1h", "to": "now" },
+      "templating": {
+        "list": [
+          {
+            "name": "datasource",
+            "type": "datasource",
+            "query": "prometheus",
+            "current": {},
+            "hide": 0
+          }
+        ]
+      },
+      "panels": [
+        {
+          "title": "Reconcile latency (p95)",
+          "type": "timeseries",
+          "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] },
+          "targets": [
+            {
+              "datasource": { "type": "prometheus", "uid": "${datasource}" },
+              "expr": "histogram_quantile(0.95, sum(rate(helmwarden_reconciliation_latency_seconds_bucket[5m])) by (le))",
+              "legendFormat": "p95",
+              "refId": "A"
+            }
+          ]
+        },
+        {
+          "title": "Reconcile error rate",
+          "type": "timeseries",
+          "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "fieldConfig": { "defaults": { "unit": "ops" }, "overrides": [] },
+          "targets": [
+            {
+              "datasource": { "type": "prometheus", "uid": "${datasource}" },
+              "expr": "sum(rate(controller_runtime_reconcile_errors_total{controller=\"application\"}[5m]))",
+              "legendFormat": "errors/s",
+              "refId": "A"
+            }
+          ]
+        },
+        {
+          "title": "Active managed Applications",
+          "type": "stat",
+          "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+          "targets": [
+            {
+              "datasource": { "type": "prometheus", "uid": "${datasource}" },
+              "expr": "sum(helmwarden_active_managed_apps)",
+              "legendFormat": "apps",
+              "refId": "A"
+            }
+          ]
+        },
+        {
+          "title": "Successful deployments (total)",
+          "type": "stat",
+          "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+          "targets": [
+            {
+              "datasource": { "type": "prometheus", "uid": "${datasource}" },
+              "expr": "sum(helmwarden_deployment_success_total)",
+              "legendFormat": "deploys",
+              "refId": "A"
+            }
+          ]
+        }
+      ]
+    }

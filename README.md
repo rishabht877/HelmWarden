@@ -48,9 +48,22 @@ kubectl get applications
 ## Status / roadmap
 
 - [x] **Phase 1** — CRD + scaffolding (`Application` types, status subresource, printer columns)
-- [ ] **Phase 2** — Helm reconciliation (install/upgrade, finalizer cleanup, namespace ownership, idempotency)
-- [ ] **Phase 3** — validating admission webhook (semver / values / namespace), cert-manager TLS
-- [ ] **Phase 4** — health-based automated rollback + CI (Trivy, GHCR)
-- [ ] **Phase 5** — Prometheus metrics + Grafana dashboard (ServiceMonitor)
+- [x] **Phase 2** — Helm reconciliation (install/upgrade, finalizer cleanup, namespace ownership, values-drift detection)
+- [x] **Phase 3** — validating admission webhook (semver / values / namespace), cert-manager TLS
+- [x] **Phase 4** — kstatus health detection + automated rollback + CI (Trivy, GHCR) + e2e
+- [x] **Phase 5** — Prometheus metrics + ServiceMonitor + Grafana dashboard
 
 The original phased design lives in [`BUILD_PLAN.md`](./BUILD_PLAN.md); this README tracks the current state.
+
+## Observability
+
+The manager exposes custom metrics on `/metrics` (registered on controller-runtime's registry):
+`helmwarden_reconciliation_latency_seconds` (histogram), `helmwarden_deployment_success_total`
+(counter), and `helmwarden_active_managed_apps` (gauge by target namespace). A `ServiceMonitor`
+(`config/prometheus/`) lets a Prometheus Operator scrape them, and
+[`config/grafana/dashboard-configmap.yaml`](./config/grafana/dashboard-configmap.yaml) ships a Grafana
+dashboard (auto-imported by the kube-prometheus-stack sidecar).
+
+To wire it up with kube-prometheus-stack, label the `ServiceMonitor` to match your Prometheus's
+`serviceMonitorSelector` (e.g. `release: prometheus`) and grant the Prometheus ServiceAccount the
+`helmwarden-metrics-reader` ClusterRole so it can authenticate to the HTTPS metrics endpoint.
