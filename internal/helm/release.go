@@ -117,6 +117,23 @@ func (m *Manager) InstallOrUpgrade(ctx context.Context, spec ReleaseSpec) (*Rele
 	return toResult(raw)
 }
 
+// Rollback reverts the release to its immediately previous revision (Helm creates a new revision
+// whose content matches the prior one). Used by the controller when a rollout fails health checks.
+func (m *Manager) Rollback(_ context.Context, releaseName, namespace string) error {
+	cfg, err := m.newActionConfig(namespace)
+	if err != nil {
+		return err
+	}
+	rb := action.NewRollback(cfg)
+	rb.Version = 0 // 0 means the immediately previous revision
+	rb.WaitStrategy = waitStrategy
+	rb.Timeout = defaultTimeout
+	if err := rb.Run(releaseName); err != nil {
+		return fmt.Errorf("helm rollback %q: %w", releaseName, err)
+	}
+	return nil
+}
+
 // Get returns the current state of a release, including its rendered manifest (used to enumerate
 // workloads for health checks). It errors if the release does not exist.
 func (m *Manager) Get(_ context.Context, releaseName, namespace string) (*ReleaseResult, error) {

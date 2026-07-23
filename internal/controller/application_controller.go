@@ -137,6 +137,7 @@ func (r *ApplicationReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		app.Status.ObservedGeneration = app.Generation
 		app.Status.LastAppliedValuesHash = valuesHash
 		app.Status.LastDeployStartTime = &now
+		app.Status.LastFailedRevision = 0 // fresh spec/values — allow one rollback for this attempt
 		app.Status.Phase = appsv1alpha1.PhaseDeploying
 		setCondition(&app, appsv1alpha1.ConditionReleased, metav1.ConditionTrue, "ReleaseApplied",
 			fmt.Sprintf("release %q at revision %d", res.Name, res.Revision))
@@ -167,26 +168,26 @@ func (r *ApplicationReconciler) reconcileHealth(ctx context.Context, app *appsv1
 		return ctrl.Result{}, err
 	}
 
+	// A failed rollout, or one still not Current past its deadline, is handled by the rollback path.
+	// A healthy (Current) release never enters here, even once its deploy start time ages past the
+	// deadline — the deadline only bounds an in-progress rollout.
+	if health == status.FailedStatus || (health != status.CurrentStatus && deadlineExceeded(app)) {
+		return r.handleUnhealthy(ctx, app, health, detail)
+	}
+
 	before := app.Status.DeepCopy()
 	var result ctrl.Result
 
 	switch {
-	case health == status.CurrentStatus:
+	case health == status.CurrentStatus && app.Status.LastFailedRevision == 0:
 		app.Status.Phase = appsv1alpha1.PhaseDeployed
 		setCondition(app, appsv1alpha1.ConditionHealthy, metav1.ConditionTrue, "AllWorkloadsCurrent", detail)
 		setCondition(app, appsv1alpha1.ConditionReady, metav1.ConditionTrue, "Deployed", "release deployed and healthy")
 		result = ctrl.Result{RequeueAfter: steadyPollInterval}
 
-	case health == status.FailedStatus || deadlineExceeded(app):
-		reason, msg := "WorkloadFailed", detail
-		if health != status.FailedStatus {
-			reason = "ProgressDeadlineExceeded"
-			msg = fmt.Sprintf("workloads not ready within %ds", app.Spec.ProgressDeadlineSeconds)
-		}
-		// Phase 4b turns this branch into an automated rollback; for now we surface Degraded.
-		app.Status.Phase = appsv1alpha1.PhaseDegraded
-		setCondition(app, appsv1alpha1.ConditionHealthy, metav1.ConditionFalse, reason, msg)
-		setCondition(app, appsv1alpha1.ConditionReady, metav1.ConditionFalse, "Degraded", msg)
+	case health == status.CurrentStatus:
+		// Healthy, but we rolled back for this spec — the desired version failed, so we intentionally
+		// stay Degraded (set by handleUnhealthy) until the spec/values change. Leave status untouched.
 		result = ctrl.Result{RequeueAfter: steadyPollInterval}
 
 	default: // InProgress / NotFound

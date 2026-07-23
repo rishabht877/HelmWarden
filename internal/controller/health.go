@@ -21,14 +21,18 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"reflect"
 	"strings"
 	"time"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	utilyaml "k8s.io/apimachinery/pkg/util/yaml"
 	"sigs.k8s.io/cli-utils/pkg/kstatus/status"
+	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	appsv1alpha1 "github.com/rishabht877/HelmWarden/api/v1alpha1"
 )
@@ -121,4 +125,66 @@ func deadlineExceeded(app *appsv1alpha1.Application) bool {
 	}
 	deadline := time.Duration(app.Spec.ProgressDeadlineSeconds) * time.Second
 	return time.Since(app.Status.LastDeployStartTime.Time) > deadline
+}
+
+// handleUnhealthy responds to a failed or deadline-exceeded rollout. If there's a previous good
+// revision and we haven't already rolled back for this spec, it triggers a Helm rollback and marks
+// the Application Degraded; otherwise it just surfaces Degraded and stops (anti-thrash: at most one
+// rollback per spec generation — LastFailedRevision is reset only when the spec/values change).
+func (r *ApplicationReconciler) handleUnhealthy(ctx context.Context, app *appsv1alpha1.Application, health status.Status, detail string) (ctrl.Result, error) {
+	log := logf.FromContext(ctx)
+
+	reason := "WorkloadFailed"
+	if health != status.FailedStatus {
+		reason = "ProgressDeadlineExceeded"
+		detail = fmt.Sprintf("workloads not ready within %ds", app.Spec.ProgressDeadlineSeconds)
+	}
+	failedRevision := app.Status.HelmRevision
+
+	switch {
+	case app.Status.LastFailedRevision != 0:
+		// Already rolled back once for this spec and it's still unhealthy — stop to avoid thrash.
+		// Terminal for this spec generation, so poll slowly.
+		return r.setDegraded(ctx, app, reason, detail+" (already rolled back; awaiting a spec fix)", steadyPollInterval)
+	case failedRevision <= 1:
+		// First install exceeded its deadline and there's no previous revision to fall back to. It
+		// may still be a slow (not stuck) rollout, so keep polling fast in case it recovers.
+		return r.setDegraded(ctx, app, reason, detail+" (no previous revision to roll back to)", healthPollInterval)
+	}
+
+	log.Info("release unhealthy; rolling back", "revision", failedRevision, "reason", reason)
+	app.Status.Phase = appsv1alpha1.PhaseRollingBack
+	app.Status.LastFailedRevision = failedRevision
+	setCondition(app, appsv1alpha1.ConditionHealthy, metav1.ConditionFalse, reason, detail)
+	setCondition(app, appsv1alpha1.ConditionReady, metav1.ConditionFalse, "RollingBack",
+		fmt.Sprintf("revision %d unhealthy; rolling back", failedRevision))
+	if err := r.Status().Update(ctx, app); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	if err := r.Helm.Rollback(ctx, app.Name, app.Spec.Namespace); err != nil {
+		return r.setDegraded(ctx, app, "RollbackFailed", err.Error(), healthPollInterval)
+	}
+	// Rollback creates a new revision; reflect it in status.
+	if rel, err := r.Helm.Get(ctx, app.Name, app.Spec.Namespace); err == nil {
+		app.Status.HelmRevision = rel.Revision
+	}
+	// Rolled back to the previous good revision — terminal for this spec until the user fixes it.
+	return r.setDegraded(ctx, app, "RolledBack",
+		fmt.Sprintf("revision %d failed health checks; rolled back to the previous revision", failedRevision), steadyPollInterval)
+}
+
+// setDegraded records a Degraded status (only writing when it actually changed) and requeues at the
+// given cadence so the operator keeps observing without churning the object.
+func (r *ApplicationReconciler) setDegraded(ctx context.Context, app *appsv1alpha1.Application, reason, msg string, requeueAfter time.Duration) (ctrl.Result, error) {
+	before := app.Status.DeepCopy()
+	app.Status.Phase = appsv1alpha1.PhaseDegraded
+	setCondition(app, appsv1alpha1.ConditionHealthy, metav1.ConditionFalse, reason, msg)
+	setCondition(app, appsv1alpha1.ConditionReady, metav1.ConditionFalse, "Degraded", msg)
+	if !reflect.DeepEqual(before, &app.Status) {
+		if err := r.Status().Update(ctx, app); err != nil {
+			return ctrl.Result{}, err
+		}
+	}
+	return ctrl.Result{RequeueAfter: requeueAfter}, nil
 }
