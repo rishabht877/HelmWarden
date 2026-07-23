@@ -24,6 +24,7 @@ import (
 	"reflect"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
@@ -82,6 +83,10 @@ type ApplicationReconciler struct {
 func (r *ApplicationReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
 
+	timer := prometheus.NewTimer(reconciliationLatency.WithLabelValues(req.Name, req.Namespace))
+	defer timer.ObserveDuration()
+	defer r.refreshActiveGauge(ctx)
+
 	var app appsv1alpha1.Application
 	if err := r.Get(ctx, req.NamespacedName, &app); err != nil {
 		return ctrl.Result{}, client.IgnoreNotFound(err)
@@ -89,7 +94,7 @@ func (r *ApplicationReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 
 	// Deletion: run cleanup behind the finalizer.
 	if !app.DeletionTimestamp.IsZero() {
-		return r.reconcileDelete(ctx, &app)
+		return ctrl.Result{}, r.reconcileDelete(ctx, &app)
 	}
 
 	// Register the finalizer before creating any external state. The Update re-triggers us; the
@@ -106,7 +111,7 @@ func (r *ApplicationReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	// release even though the Application's spec generation is unchanged.
 	values, valuesHash, err := r.resolveValues(ctx, &app)
 	if err != nil {
-		return r.fail(ctx, &app, "ValuesError", err)
+		return ctrl.Result{}, r.fail(ctx, &app, "ValuesError", err)
 	}
 
 	// Has the desired state changed (new spec generation or new values)? If so, run an
@@ -117,7 +122,7 @@ func (r *ApplicationReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 
 	if needsApply {
 		if err := r.ensureNamespace(ctx, app.Spec.Namespace); err != nil {
-			return r.fail(ctx, &app, "NamespaceError", fmt.Errorf("ensure namespace %q: %w", app.Spec.Namespace, err))
+			return ctrl.Result{}, r.fail(ctx, &app, "NamespaceError", fmt.Errorf("ensure namespace %q: %w", app.Spec.Namespace, err))
 		}
 		log.Info("applying release", "chart", app.Spec.ChartName, "version", app.Spec.Version, "namespace", app.Spec.Namespace)
 		res, err := r.Helm.InstallOrUpgrade(ctx, helm.ReleaseSpec{
@@ -129,7 +134,7 @@ func (r *ApplicationReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 			Values:      values,
 		})
 		if err != nil {
-			return r.fail(ctx, &app, "HelmError", err)
+			return ctrl.Result{}, r.fail(ctx, &app, "HelmError", err)
 		}
 		now := metav1.Now()
 		app.Status.HelmReleaseName = res.Name
@@ -180,6 +185,10 @@ func (r *ApplicationReconciler) reconcileHealth(ctx context.Context, app *appsv1
 
 	switch {
 	case health == status.CurrentStatus && app.Status.LastFailedRevision == 0:
+		if before.Phase != appsv1alpha1.PhaseDeployed {
+			// Count only the transition into Deployed, not every steady-state re-check.
+			deploymentSuccessTotal.WithLabelValues(app.Name, app.Namespace).Inc()
+		}
 		app.Status.Phase = appsv1alpha1.PhaseDeployed
 		setCondition(app, appsv1alpha1.ConditionHealthy, metav1.ConditionTrue, "AllWorkloadsCurrent", detail)
 		setCondition(app, appsv1alpha1.ConditionReady, metav1.ConditionTrue, "Deployed", "release deployed and healthy")
@@ -209,25 +218,25 @@ func (r *ApplicationReconciler) reconcileHealth(ctx context.Context, app *appsv1
 }
 
 // reconcileDelete uninstalls the release, GCs the namespace if we own it, then drops the finalizer.
-func (r *ApplicationReconciler) reconcileDelete(ctx context.Context, app *appsv1alpha1.Application) (ctrl.Result, error) {
+func (r *ApplicationReconciler) reconcileDelete(ctx context.Context, app *appsv1alpha1.Application) error {
 	log := logf.FromContext(ctx)
 	if !controllerutil.ContainsFinalizer(app, finalizerName) {
-		return ctrl.Result{}, nil
+		return nil
 	}
 
 	if err := r.Helm.Uninstall(ctx, app.Name, app.Spec.Namespace); err != nil {
-		return ctrl.Result{}, fmt.Errorf("uninstall release %q: %w", app.Name, err)
+		return fmt.Errorf("uninstall release %q: %w", app.Name, err)
 	}
 	if err := r.maybeDeleteNamespace(ctx, app); err != nil {
-		return ctrl.Result{}, err
+		return err
 	}
 
 	controllerutil.RemoveFinalizer(app, finalizerName)
 	if err := r.Update(ctx, app); err != nil {
-		return ctrl.Result{}, err
+		return err
 	}
 	log.Info("finalized application", "release", app.Name, "namespace", app.Spec.Namespace)
-	return ctrl.Result{}, nil
+	return nil
 }
 
 // ensureNamespace creates the target namespace if absent, tagging namespaces we create with the
@@ -341,14 +350,14 @@ func (r *ApplicationReconciler) applicationsForSecret(ctx context.Context, obj c
 }
 
 // fail records a failure on status and returns the causing error so the request is requeued.
-func (r *ApplicationReconciler) fail(ctx context.Context, app *appsv1alpha1.Application, reason string, cause error) (ctrl.Result, error) {
+func (r *ApplicationReconciler) fail(ctx context.Context, app *appsv1alpha1.Application, reason string, cause error) error {
 	app.Status.Phase = appsv1alpha1.PhaseFailed
 	setCondition(app, appsv1alpha1.ConditionReleased, metav1.ConditionFalse, reason, cause.Error())
 	setCondition(app, appsv1alpha1.ConditionReady, metav1.ConditionFalse, reason, cause.Error())
 	if uerr := r.Status().Update(ctx, app); uerr != nil {
-		return ctrl.Result{}, uerr
+		return uerr
 	}
-	return ctrl.Result{}, cause
+	return cause
 }
 
 // setCondition upserts a status condition, stamping it with the current generation.
