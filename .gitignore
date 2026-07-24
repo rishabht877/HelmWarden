@@ -31,3 +31,7 @@ go.work
 
 # Local tooling / session state
 .claude/
+
+# Local prep notes — never commit. Neutral pattern so the repo doesn't advertise
+# what these are; the actual files (e.g. INTERVIEW_LOG.local.md) stay on disk only.
+*.local.md
